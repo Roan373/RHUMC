@@ -4,7 +4,7 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 session_start();
-require_once 'db.php'; // Make sure this file establishes $conn properly
+require_once 'db.php'; // This file should establish $conn to your new database
 
 $message = "";
 
@@ -17,7 +17,7 @@ if (!isset($_SESSION['lockout_time'])) {
 }
 
 $max_attempts = 3;
-$lockout_duration = 60; // Lockout period in seconds (5 minutes)
+$lockout_duration = 60; // Lockout period in seconds
 
 // Check if the user is currently locked out
 if ($_SESSION['login_attempts'] >= $max_attempts) {
@@ -40,37 +40,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['login_attempts'] < $max_
     if (empty($username) || empty($password)) {
         $message = "Both username and password are required.";
     } else {
-        // Retrieve user info.
-        $stmt = $conn->prepare("SELECT user_id, username, password, role_id, access_level_id FROM users WHERE username = ?");
+        // Use the new database's table name `user`
+        $stmt = $conn->prepare("SELECT user_id, username, password, role_id FROM `user` WHERE username = ?");
         if ($stmt) {
             $stmt->bind_param("s", $username);
             $stmt->execute();
             $result = $stmt->get_result();
             if ($result && $result->num_rows === 1) {
                 $user = $result->fetch_assoc();
-                // If the stored password is empty, update it with the provided password.
+                // If the stored password is empty, update it with the provided password
                 if (empty($user['password'])) {
-                    $updateStmt = $conn->prepare("UPDATE users SET password = ? WHERE user_id = ?");
+                    $updateStmt = $conn->prepare("UPDATE `user` SET password = ? WHERE user_id = ?");
                     $updateStmt->bind_param("si", $password, $user['user_id']);
                     $updateStmt->execute();
                     $updateStmt->close();
                     
-                    // Reset login attempts and log the user in.
+                    // Reset login attempts and log the user in
                     $_SESSION['login_attempts'] = 0;
                     $_SESSION['user_id'] = $user['user_id'];
                     $_SESSION['username'] = $user['username'];
                     $_SESSION['role_id'] = $user['role_id'];
-                    $_SESSION['access_level_id'] = $user['access_level_id'];
                     header("Location: index.php");
                     exit;
                 } else {
-                    // Normal login: compare the plain text password.
+                    // Compare the plain text password (consider hashing for production)
                     if ($password === $user['password']) {
                         $_SESSION['login_attempts'] = 0; // reset on success
                         $_SESSION['user_id'] = $user['user_id'];
                         $_SESSION['username'] = $user['username'];
                         $_SESSION['role_id'] = $user['role_id'];
-                        $_SESSION['access_level_id'] = $user['access_level_id'];
                         header("Location: index.php");
                         exit;
                     } else {
