@@ -22,8 +22,7 @@
     --color-in-stock: #28a745;
     --color-out-stock: #e83838;
     --out-pending-stock: #151212;
-
-    
+  
     /* Layout Sizing */
     --sidebar-width: 260px;
     --page-content-margin-left: 260px; /* Keep aligned with --sidebar-width */
@@ -477,7 +476,7 @@
   .status.out-of-stock {
     background-color: var(--color-out-stock);
   }
-
+  
   .status.out-pending-stock {
     background-color: var(--color-pending-stock);
   }
@@ -630,13 +629,14 @@
     margin-bottom: 5px;
     color: var(--color-text);
   }
+  
   .form-group .nav-button {
     color: #999999;
     display: block;
-        margin-bottom: 5px;
+    margin-bottom: 5px;
     text-align: center;
-}
-
+  }
+  
   .form-group input,
   .form-group select {
     width: 100%;
@@ -723,12 +723,13 @@
     height: auto;
     display: block;
   }
-
+  
   /* Sidebar logout styling */
   .logout-sidebar {
     margin-top: 250px; /* adds spacing from nav items */
     text-align: center;
   }
+  
   .logout-sidebar a {
     color: #fff;
     background-color: rgb(191, 100, 100);
@@ -738,3 +739,92 @@
     display: inline-block;
   }
   
+/* Login Container: full viewport height minus header, centered */
+.login-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - var(--header-height)); /* Full height available */
+  background-color: var(--color-light);
+}
+
+/* Card-style login box */
+.login-box {
+  background-color: #fff;
+  padding: 30px 40px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px var(--color-box-shadow);
+  width: 100%;
+  max-width: 400px;
+}
+
+/* Adjusted header within the card */
+.login-box h1 {
+  text-align: center;
+  margin-bottom: 20px;
+  color: var(--color-primary);
+}
+
+/* Form styles remain the same */
+.form-group {
+  margin-bottom: 15px;
+}
+
+.form-group label {
+  display: block;
+  font-weight: bold;
+  margin-bottom: 5px;
+  color: var(--color-text);
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  font-size: 1em;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 3px rgba(125, 215, 45, 0.5);
+}
+
+.login-button {
+  width: 100%;
+  padding: 10px;
+  background-color: var(--color-primary);
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  font-size: 1em;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+}
+
+.login-button:hover {
+  background-color: #0069d9;
+}
+
+.login-message {
+  text-align: center;
+  margin-bottom: 15px;
+  color: #e83838;
+}
+
+/* Link styles for additional navigation (register, forgot password) */
+.login-box p {
+  text-align: center;
+  margin-top: 10px;
+}
+
+.login-box a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.login-box a:hover {
+  text-decoration: underline;
+}
