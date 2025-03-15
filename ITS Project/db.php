@@ -1,13 +1,15 @@
 <?php
 // db.php
 $host = 'localhost';
-$db   = 'macpharmacy_db';
+$db   = 'macpharmacy_db'; // Ensure this matches the database name in phpMyAdmin
 $user = 'root';
-$pass = '';
+$pass = ''; // Replace with your MySQL password if you have one
 
-$conn = new mysqli($host, $user, $pass, $db);
+// Create connection
+$mysqli = new mysqli($host, $user, $pass, $db);
 
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
+// Check connection
+if ($mysqli->connect_error) {
+    die("Connection failed: " . $mysqli->connect_error);
 }
 ?>
