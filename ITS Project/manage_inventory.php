@@ -1,4 +1,395 @@
+<?php
+session_start();
+require_once 'db.php'; // Assumes $conn is defined in db.php
+$roles = [];
+$sqlRoles = "SELECT role_id, role_name FROM roles ORDER BY role_name ASC";
+$resultRoles = $conn->query($sqlRoles);
+if ($resultRoles) {
+    while ($row = $resultRoles->fetch_assoc()) {
+        $roles[] = $row;
+    }
+    $resultRoles->free();
+}
 
+
+// Default profile name in case no user is logged in.
+$profile_name = 'Guest';
+
+// Check if the user is logged in (assuming user_id is stored in session)
+if (isset($_SESSION['user_id'])) {
+    $user_id = $_SESSION['user_id'];
+
+    // Retrieve the full name from staff_details using the users table
+    $sql = "SELECT sd.full_name 
+            FROM staff_details sd 
+            JOIN users u ON sd.staff_id = u.staff_id 
+            WHERE u.user_id = ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($full_name);
+        if ($stmt->fetch()) {
+            $profile_name = $full_name;
+        }
+        $stmt->close();
+    }
+}
+// ===========================
+// Retrieve Distinct Categories from inventory (via medicine join)
+// ===========================
+$categories = [];
+$sql = "SELECT DISTINCT m.category FROM inventory i JOIN medicine m ON i.medicine_id = m.medicine_id ORDER BY m.category ASC";
+$result = $conn->query($sql);
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        if (!empty($row['category'])) {
+            $categories[] = $row['category'];
+        }
+    }
+    $result->free();
+}
+
+// ===========================
+// Helper Functions
+// ===========================
+
+// Compute stock status based on quantity.
+if (!function_exists('compute_status')) {
+    function compute_status($quantity) {
+        $quantity = is_numeric($quantity) ? intval($quantity) : 0;
+        if ($quantity <= 0) {
+            return "Out of Stock";
+        } elseif ($quantity < 10) {
+            return "Low Stock";
+        } else {
+            return "In Stock";
+        }
+    }
+}
+
+// Retrieve a single inventory item by medicine name (via join)
+function get_item_by_name($conn, $name) {
+    $stmt = $conn->prepare("SELECT i.*, m.medicine_name AS name, m.category 
+                            FROM inventory i 
+                            JOIN medicine m ON i.medicine_id = m.medicine_id 
+                            WHERE m.medicine_name = ? LIMIT 1");
+    if (!$stmt) return null;
+    $stmt->bind_param("s", $name);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $item = $result->fetch_assoc();
+    $stmt->close();
+    return $item;
+}
+
+// ===========================
+// Compute Total Items in Stock
+// ===========================
+$sqlTotal = "SELECT SUM(quantity) AS totalStock FROM inventory";
+$resultTotal = $conn->query($sqlTotal);
+$totalStock = 0;
+if ($resultTotal) {
+    $row = $resultTotal->fetch_assoc();
+    $totalStock = !empty($row['totalStock']) ? $row['totalStock'] : 0;
+    $resultTotal->free();
+}
+
+// ===========================
+// Process POST Actions for Deduct, Delete, Mark Out, and Edit
+// ===========================
+$message = "";
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'], $_POST['name']) && !isset($_POST['generate_report'])) {
+    $itemName = trim($_POST['name']); // This is the medicine name.
+    if (empty($itemName)) {
+        $message = "Error: Item name is required.";
+    } else {
+        if ($_POST['action'] === 'deduct') {
+            if (!isset($_POST['deduct_amount']) || !is_numeric($_POST['deduct_amount']) || intval($_POST['deduct_amount']) <= 0) {
+                $message = "Error: Please enter a valid deduction amount.";
+            } else {
+                $deductAmount = intval($_POST['deduct_amount']);
+                // Fetch current quantity using join.
+                $stmt = $conn->prepare("SELECT i.quantity 
+                                        FROM inventory i 
+                                        JOIN medicine m ON i.medicine_id = m.medicine_id 
+                                        WHERE m.medicine_name = ?");
+                $stmt->bind_param("s", $itemName);
+                $stmt->execute();
+                $stmt->bind_result($currentQuantity);
+                if ($stmt->fetch()) {
+                    $stmt->close();
+                    // Allow negative inventory by removing max(0, ...)
+                    $newQuantity = $currentQuantity - $deductAmount;
+                    $newStatus = compute_status($newQuantity);
+                    // Update via join.
+                    $stmt = $conn->prepare("UPDATE inventory i 
+                                            JOIN medicine m ON i.medicine_id = m.medicine_id 
+                                            SET i.quantity = ?, i.status = ? 
+                                            WHERE m.medicine_name = ?");
+                    $stmt->bind_param("iss", $newQuantity, $newStatus, $itemName);
+                    $stmt->execute();
+                    if ($stmt->affected_rows > 0) {
+                        $message = "Success: Deducted {$deductAmount} from {$itemName}.";
+                    } else {
+                        $message = "Error: No rows updated. Please check the item name.";
+                    }
+                    $stmt->close();
+                } else {
+                    $stmt->close();
+                    $message = "Error: Item not found.";
+                }
+            }
+        } elseif ($_POST['action'] === 'delete') {
+            // Delete inventory item via join.
+            $stmt = $conn->prepare("DELETE i 
+                                    FROM inventory i 
+                                    JOIN medicine m ON i.medicine_id = m.medicine_id 
+                                    WHERE m.medicine_name = ?");
+            $stmt->bind_param("s", $itemName);
+            $stmt->execute();
+            if ($stmt->affected_rows > 0) {
+                $message = "Success: Deleted {$itemName}.";
+            } else {
+                $message = "Error: Item not found.";
+            }
+            $stmt->close();
+        } elseif ($_POST['action'] === 'markout') {
+            // Mark the item as out of stock (set quantity to 0).
+            $newStatus = compute_status(0);
+            $stmt = $conn->prepare("UPDATE inventory i 
+                                    JOIN medicine m ON i.medicine_id = m.medicine_id 
+                                    SET i.quantity = 0, i.status = ? 
+                                    WHERE m.medicine_name = ?");
+            $stmt->bind_param("ss", $newStatus, $itemName);
+            $stmt->execute();
+            if ($stmt->affected_rows > 0) {
+                $message = "Success: Marked {$itemName} as out of stock.";
+            } else {
+                $message = "Error: Item not found.";
+            }
+            $stmt->close();
+        } elseif ($_POST['action'] === 'edit') {
+            // Removed check for negative values so negative inventory is allowed.
+            if (!isset($_POST['new_quantity']) || !is_numeric($_POST['new_quantity'])) {
+                $message = "Error: Please enter a valid quantity.";
+            } else {
+                $newQuantity = intval($_POST['new_quantity']);
+                $newStatus = compute_status($newQuantity);
+                $stmt = $conn->prepare("UPDATE inventory i 
+                                        JOIN medicine m ON i.medicine_id = m.medicine_id 
+                                        SET i.quantity = ?, i.status = ? 
+                                        WHERE m.medicine_name = ?");
+                $stmt->bind_param("iss", $newQuantity, $newStatus, $itemName);
+                $stmt->execute();
+                if ($stmt->affected_rows > 0) {
+                    $message = "Success: Updated quantity for {$itemName} to {$newQuantity}.";
+                } else {
+                    $message = "Error: Update failed or no changes made.";
+                }
+                $stmt->close();
+            }
+        }
+    }
+}
+
+// ===========================
+// Process the Add Inventory Item form submission
+// ===========================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_meds'])) {
+    $name       = trim($_POST['name']);       // Medicine name
+    $category   = trim($_POST['category']);     // Category from form
+    $quantity   = isset($_POST['quantity']) ? intval($_POST['quantity']) : 0;
+    $dateIssued = trim($_POST['dateIssued']);
+    $expiryDate = trim($_POST['expiryDate']);
+    $errors = [];
+    if (empty($name)) {
+        $errors[] = "Item name is required.";
+    }
+    if (empty($category)) {
+        $errors[] = "Category is required.";
+    }
+    if ($quantity <= 0) {
+        $errors[] = "Quantity must be a positive number.";
+    }
+    if (empty($dateIssued)) {
+        $errors[] = "Date Issued is required.";
+    }
+    if (empty($expiryDate)) {
+        $errors[] = "Expiry Date is required.";
+    }
+    if (!empty($errors)) {
+        $message = implode("<br>", $errors);
+    } else {
+        $status = compute_status($quantity);
+        // First, check if the medicine exists.
+        $stmt = $conn->prepare("SELECT medicine_id FROM medicine WHERE medicine_name = ?");
+        $stmt->bind_param("s", $name);
+        $stmt->execute();
+        $resultMed = $stmt->get_result();
+        if ($row = $resultMed->fetch_assoc()) {
+            $medicine_id = $row['medicine_id'];
+        } else {
+            $stmt->close();
+            $stmt = $conn->prepare("INSERT INTO medicine (medicine_name, category) VALUES (?, ?)");
+            $stmt->bind_param("ss", $name, $category);
+            if ($stmt->execute()) {
+                $medicine_id = $stmt->insert_id;
+            } else {
+                $message = "Error inserting medicine: " . $stmt->error;
+                $stmt->close();
+                goto end_output; // jump to end output section
+            }
+        }
+        $stmt->close();
+        // Insert new inventory record using the medicine_id.
+        $stmt = $conn->prepare("INSERT INTO inventory (medicine_id, quantity, date_issued, expiry_date, status) VALUES (?, ?, ?, ?, ?)");
+        if (!$stmt) {
+            $message = "Database error: " . $conn->error;
+        } else {
+            $stmt->bind_param("iisss", $medicine_id, $quantity, $dateIssued, $expiryDate, $status);
+            if ($stmt->execute()) {
+                header("Location: manage_inventory.php?message=" . urlencode("Inventory item added successfully."));
+                exit;
+            } else {
+                $message = "Error adding inventory item: " . $stmt->error;
+            }
+            $stmt->close();
+        }
+    }
+}
+
+// ===========================
+// Process "Generate Report" Form Submission
+// ===========================
+$reportGenerated = false;
+$reportError = "";
+$reportSummary = [];
+$reportItems = [];
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['generate_report'])) {
+    $r_category    = isset($_POST['report_category']) ? trim($_POST['report_category']) : '';
+    $r_stockType   = isset($_POST['report_stock_type']) ? trim($_POST['report_stock_type']) : '';
+    $r_stockStatus = isset($_POST['report_stock_status']) ? trim($_POST['report_stock_status']) : '';
+    if (empty($r_category)) {
+        $r_category = "all";
+    }
+    // Build query joining inventory and medicine.
+    $r_sql = "SELECT i.*, m.medicine_name as name, m.category 
+              FROM inventory i JOIN medicine m ON i.medicine_id = m.medicine_id WHERE 1=1";
+    $r_params = [];
+    $r_types = "";
+    if ($r_category !== "all") {
+        $r_sql .= " AND m.category = ?";
+        $r_params[] = $r_category;
+        $r_types .= "s";
+    }
+    if ($r_stockType === 'expired') {
+        $r_sql .= " AND i.expiry_date < CURDATE()";
+    } elseif ($r_stockType === 'new') {
+        $r_sql .= " AND i.expiry_date >= CURDATE()";
+    }
+    if (!empty($r_stockStatus) && in_array($r_stockStatus, ['In Stock', 'Low Stock', 'Out of Stock'])) {
+        $r_sql .= " AND i.status = ?";
+        $r_params[] = $r_stockStatus;
+        $r_types .= "s";
+    }
+    $stmt = $conn->prepare($r_sql);
+    if ($stmt) {
+        if (!empty($r_params)) {
+            $stmt->bind_param($r_types, ...$r_params);
+        }
+        $stmt->execute();
+        $resultReport = $stmt->get_result();
+        $totalItems = 0;
+        $totalQuantity = 0;
+        $statusCounts = [
+            "In Stock"     => 0,
+            "Low Stock"    => 0,
+            "Out of Stock" => 0
+        ];
+        $reportItems = [];
+        while ($row = $resultReport->fetch_assoc()) {
+            $reportItems[] = $row;
+            $totalItems++;
+            $totalQuantity += intval($row['quantity']);
+            $status = $row['status'];
+            if (isset($statusCounts[$status])) {
+                $statusCounts[$status]++;
+            }
+        }
+        $stmt->close();
+        $reportSummary = [
+            "Category"         => ($r_category === "all") ? "All Categories" : $r_category,
+            "Total Items"      => $totalItems,
+            "Total Quantity"   => $totalQuantity,
+            "Status Breakdown" => $statusCounts
+        ];
+        $reportGenerated = true;
+    } else {
+        $reportError = "Database error: " . $conn->error;
+    }
+}
+
+// ===========================
+// Process Filter Inventory for Display (GET parameters)
+// ===========================
+$sql = "SELECT i.*, m.medicine_name as name, m.category 
+        FROM inventory i 
+        JOIN medicine m ON i.medicine_id = m.medicine_id 
+        WHERE 1=1";
+$params = [];
+$types = "";
+if (isset($_GET['filter_name']) && trim($_GET['filter_name']) !== "") {
+    $sql .= " AND m.medicine_name LIKE ?";
+    $params[] = "%" . trim($_GET['filter_name']) . "%";
+    $types .= "s";
+}
+if (isset($_GET['filter_category']) && $_GET['filter_category'] !== "all" && trim($_GET['filter_category']) !== "") {
+    $filter_category = trim($_GET['filter_category']);
+    $sql .= " AND m.category = ?";
+    $params[] = $filter_category;
+    $types .= "s";
+}
+if (isset($_GET['filter_stock_type']) && trim($_GET['filter_stock_type']) !== "") {
+    $filter_stock_type = trim($_GET['filter_stock_type']);
+    if ($filter_stock_type === 'expired') {
+        $sql .= " AND i.expiry_date < CURDATE()";
+    } elseif ($filter_stock_type === 'new') {
+        $sql .= " AND i.expiry_date >= CURDATE()";
+    }
+}
+if (isset($_GET['filter_stock_status']) && trim($_GET['filter_stock_status']) !== "") {
+    $filter_stock_status = trim($_GET['filter_stock_status']);
+    $sql .= " AND i.status = ?";
+    $params[] = $filter_stock_status;
+    $types .= "s";
+}
+$stmt = $conn->prepare($sql);
+if ($params) {
+    $stmt->bind_param($types, ...$params);
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$filtered_inventory = [];
+while ($row = $result->fetch_assoc()) {
+    $filtered_inventory[] = $row;
+}
+$stmt->close();
+
+// ===========================
+// Retrieve Transaction History
+// ===========================
+$sql = "SELECT * FROM transactions ORDER BY transaction_date DESC";
+$result = $conn->query($sql);
+$transaction_history = [];
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $transaction_history[] = $row;
+    }
+    $result->free();
+}
+end_output:
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,6 +397,7 @@
   <title>Manage Medicine Inventory</title>
   <link rel="stylesheet" href="style.css">
   <script>
+    // Optional: Client-side validation or UI enhancements.
   </script>
 </head>
 <body>

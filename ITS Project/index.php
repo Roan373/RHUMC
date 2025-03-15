@@ -1,4 +1,106 @@
+<?php
+require_once 'db.php';
+$roles = [];
+$sqlRoles = "SELECT role_id, role_name FROM roles ORDER BY role_name ASC";
+$resultRoles = $conn->query($sqlRoles);
+if ($resultRoles) {
+    while ($row = $resultRoles->fetch_assoc()) {
+        $roles[] = $row;
+    }
+    $resultRoles->free();
+}
+session_start();
+if (!isset($_SESSION['user_id'])) {
+    header("Location: login.php");
+    exit;}
 
+    
+// Default profile name in case no user is logged in.
+$profile_name = 'Guest';
+
+// Check if the user is logged in (assuming user_id is stored in session)
+if (isset($_SESSION['user_id'])) {
+    $user_id = $_SESSION['user_id'];
+
+    // Retrieve the full name from staff_details using the users table
+    $sql = "SELECT sd.full_name 
+            FROM staff_details sd 
+            JOIN users u ON sd.staff_id = u.staff_id 
+            WHERE u.user_id = ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($full_name);
+        if ($stmt->fetch()) {
+            $profile_name = $full_name;
+        }
+        $stmt->close();
+    }
+}
+// ---------------------------
+// 1. Current Stock Status:
+// Determine overall status based on critical items (quantity < 3).
+// ---------------------------
+$queryCritical = "SELECT COUNT(*) as count FROM inventory WHERE quantity < 3";
+$resultCritical = $conn->query($queryCritical);
+$rowCritical = $resultCritical->fetch_assoc();
+$criticalCount = $rowCritical['count'];
+$currentStockStatus = ($criticalCount > 0) ? "Attention" : "Good";
+
+// ---------------------------
+// 2. Stock Dispensed Today:
+// Count the number of transactions recorded for today.
+$queryStockDispensed = "SELECT COUNT(*) as count FROM transactions WHERE DATE(transaction_date) = CURDATE()";
+$resultStockDispensed = $conn->query($queryStockDispensed);
+$rowStockDispensed = $resultStockDispensed->fetch_assoc();
+$stockDispensedToday = $rowStockDispensed['count'];
+
+// ---------------------------
+// 3. Daily Prescription Monitoring:
+// Count prescriptions with 'Completed' and 'Pending' statuses.
+$queryPrescriptions = "SELECT 
+    (SELECT COUNT(*) FROM prescriptions WHERE status = 'Completed') as dispensed,
+    (SELECT COUNT(*) FROM prescriptions WHERE status = 'Pending') as undispensed";
+$resultPrescriptions = $conn->query($queryPrescriptions);
+$rowPrescriptions = $resultPrescriptions->fetch_assoc();
+$dispensedPrescriptions   = $rowPrescriptions['dispensed'];
+$undispensedPrescriptions = $rowPrescriptions['undispensed'];
+
+// ---------------------------
+// 4. Recent Prescriptions:
+// Retrieve the last three prescriptions ordered by creation date.
+// Join with patients table to get the patient name.
+$queryRecent = "SELECT p.prescription_code as id, pat.full_name as patient, p.status 
+                FROM prescriptions p
+                JOIN patients pat ON p.patient_id = pat.patient_id
+                ORDER BY p.created_at DESC LIMIT 3";
+$resultRecent = $conn->query($queryRecent);
+$recentPrescriptions = [];
+while ($row = $resultRecent->fetch_assoc()) {
+    $recentPrescriptions[] = $row;
+}
+
+// ---------------------------
+// 5. Inventory Warnings:
+// Retrieve inventory items with low stock (quantity less than 5) and determine a warning status.
+// Join inventory with medicine table to get the medicine name.
+$queryWarnings = "SELECT i.inventory_id as item_no, m.medicine_name as medicine, i.quantity, 
+    CASE 
+       WHEN i.quantity = 0 THEN 'Out of Stock'
+       WHEN i.quantity < 3 THEN 'Critical'
+       WHEN i.quantity < 5 THEN 'Low Stock'
+       ELSE 'In Stock'
+    END as status
+FROM inventory i
+JOIN medicine m ON i.medicine_id = m.medicine_id
+WHERE i.quantity < 5";
+$resultWarnings = $conn->query($queryWarnings);
+$inventoryWarnings = [];
+while ($row = $resultWarnings->fetch_assoc()) {
+    $inventoryWarnings[] = $row;
+}
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>

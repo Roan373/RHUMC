@@ -1,4 +1,172 @@
+<?php
+session_start();
+require_once 'db.php'; // Assumes $conn is defined in db.php
 
+// Redirect to login if not logged in
+if (!isset($_SESSION['user_id'])) {
+    header("Location: login.php");
+    exit;
+}
+
+// Default profile name in case no user is logged in.
+$profile_name = 'Guest';
+
+// Check if the user is logged in (assuming user_id is stored in session)
+if (isset($_SESSION['user_id'])) {
+    $user_id = $_SESSION['user_id'];
+
+    // Retrieve the full name from staff_details using the users table
+    $sql = "SELECT sd.full_name 
+            FROM staff_details sd 
+            JOIN users u ON sd.staff_id = u.staff_id 
+            WHERE u.user_id = ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($full_name);
+        if ($stmt->fetch()) {
+            $profile_name = $full_name;
+        }
+        $stmt->close();
+    }
+}
+// ---------------------------
+// Fetch available roles from SQL
+// ---------------------------
+$roles = [];
+$sqlRoles = "SELECT role_id, role_name FROM roles ORDER BY role_name ASC";
+$resultRoles = $conn->query($sqlRoles);
+if ($resultRoles) {
+    while ($row = $resultRoles->fetch_assoc()) {
+        $roles[] = $row;
+    }
+    $resultRoles->free();
+}
+
+$message = "";
+
+// ---------------------------
+// Process GET/POST Actions
+// ---------------------------
+
+// DELETE Account
+if (isset($_GET['action']) && $_GET['action'] === 'delete' && isset($_GET['id'])) {
+    $delete_id = $_GET['id'];
+    $stmt = $conn->prepare("DELETE FROM users WHERE user_id = ?");
+    $stmt->bind_param("i", $delete_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: manage_accounts.php");
+    exit;
+}
+
+// CREATE Account
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'create') {
+    $username = $_POST['username'];
+    $name = $_POST['name'];
+    $roleName = $_POST['role'];
+    // No password is provided; store an empty string.
+    $hashedPassword = "";
+    // For simplicity, assign a default access level.
+    $defaultAccessLevel = 1;
+
+    // Insert into staff_details to get a staff_id.
+    $stmt = $conn->prepare("INSERT INTO staff_details (full_name) VALUES (?)");
+    $stmt->bind_param("s", $name);
+    $stmt->execute();
+    $staff_id = $stmt->insert_id;
+    $stmt->close();
+
+    // Lookup role_id based on role name.
+    $role_id = null;
+    $stmt = $conn->prepare("SELECT role_id FROM roles WHERE role_name = ? LIMIT 1");
+    $stmt->bind_param("s", $roleName);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    if ($row = $result->fetch_assoc()) {
+        $role_id = $row['role_id'];
+    }
+    $stmt->close();
+
+    if (!$role_id) {
+        $message = "Error: Invalid role selected.";
+    } else {
+        // Insert into users table using the empty password.
+        $stmt = $conn->prepare("INSERT INTO users (staff_id, username, password, role_id, access_level_id) VALUES (?, ?, ?, ?, ?)");
+        $stmt->bind_param("issii", $staff_id, $username, $hashedPassword, $role_id, $defaultAccessLevel);
+        $stmt->execute();
+        $stmt->close();
+        header("Location: manage_accounts.php");
+        exit;
+    }
+}
+
+// EDIT Account
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['action']) && $_GET['action'] === 'edit' && isset($_GET['id'])) {
+    $edit_id = $_GET['id'];
+    $roleName = $_POST['role'];
+    $defaultAccessLevel = 1; // For simplicity, reset to default
+
+    // Lookup role_id based on role name.
+    $role_id = null;
+    $stmt = $conn->prepare("SELECT role_id FROM roles WHERE role_name = ? LIMIT 1");
+    $stmt->bind_param("s", $roleName);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    if ($row = $result->fetch_assoc()) {
+        $role_id = $row['role_id'];
+    }
+    $stmt->close();
+
+    if (!$role_id) {
+        $message = "Error: Invalid role selected.";
+    } else {
+        $stmt = $conn->prepare("UPDATE users SET role_id = ?, access_level_id = ? WHERE user_id = ?");
+        $stmt->bind_param("iii", $role_id, $defaultAccessLevel, $edit_id);
+        $stmt->execute();
+        $stmt->close();
+        header("Location: manage_accounts.php");
+        exit;
+    }
+}
+
+// ---------------------------
+// Build Filter Query for Accounts
+// ---------------------------
+$sql = "SELECT u.user_id as id, u.username, sd.full_name as name, r.role_name as role, al.level_name as access, u.created_at
+        FROM users u
+        JOIN staff_details sd ON u.staff_id = sd.staff_id
+        JOIN roles r ON u.role_id = r.role_id
+        JOIN access_levels al ON u.access_level_id = al.access_level_id
+        WHERE 1=1";
+$params = [];
+$types = "";
+if (isset($_GET['filter_name']) && $_GET['filter_name'] !== "") {
+    $sql .= " AND (sd.full_name LIKE ? OR u.username LIKE ?)";
+    $filter = "%" . $_GET['filter_name'] . "%";
+    $params[] = $filter;
+    $params[] = $filter;
+    $types .= "ss";
+}
+if (isset($_GET['filter_role']) && $_GET['filter_role'] !== "") {
+    $sql .= " AND r.role_name = ?";
+    $params[] = $_GET['filter_role'];
+    $types .= "s";
+}
+$sql .= " ORDER BY u.user_id ASC";
+
+$stmt = $conn->prepare($sql);
+if (!empty($params)) {
+    $stmt->bind_param($types, ...$params);
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$accounts = [];
+while ($row = $result->fetch_assoc()) {
+    $accounts[] = $row;
+}
+$stmt->close();
 ?>
 <!DOCTYPE html>
 <html lang="en">

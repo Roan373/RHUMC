@@ -1,4 +1,330 @@
+<?php
+session_start();
+require_once 'db.php'; // Assumes $conn is defined in db.php
 
+// Fetch available roles (for navigation)
+$roles = [];
+$sqlRoles = "SELECT role_id, role_name FROM roles ORDER BY role_name ASC";
+$resultRoles = $conn->query($sqlRoles);
+if ($resultRoles) {
+    while ($row = $resultRoles->fetch_assoc()) {
+        $roles[] = $row;
+    }
+    $resultRoles->free();
+}
+
+// Default profile name in case no user is logged in.
+$profile_name = 'Guest';
+
+// Check if the user is logged in (assuming user_id is stored in session)
+if (isset($_SESSION['user_id'])) {
+    $user_id = $_SESSION['user_id'];
+
+    // Retrieve the full name from staff_details using the users table
+    $sql = "SELECT sd.full_name 
+            FROM staff_details sd 
+            JOIN users u ON sd.staff_id = u.staff_id 
+            WHERE u.user_id = ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($full_name);
+        if ($stmt->fetch()) {
+            $profile_name = $full_name;
+        }
+        $stmt->close();
+    }
+}
+// ---------------------------
+// Process Internal Dispense (Pending Prescription)
+// ---------------------------
+$dispense_success = "";
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['process_dispense'])) {
+    $prescription_code = $_POST['prescription_id'] ?? '';
+    $patient = $_POST['patient'] ?? '';
+    // For internal dispense, we now use default values for source and email.
+    $source = "Inhouse";
+    $email = "";
+    
+    if (empty($prescription_code) || empty($patient)) {
+        die("Missing required form data.");
+    }
+    
+    // Retrieve the pending prescription
+    $stmt = $conn->prepare("SELECT p.prescription_id, p.prescription_code, pat.full_name as patient_name 
+                             FROM prescriptions p 
+                             JOIN patients pat ON p.patient_id = pat.patient_id 
+                             WHERE p.prescription_code = ? AND p.status = 'pending' LIMIT 1");
+    if (!$stmt) {
+        die("Prepare failed (select): " . $conn->error);
+    }
+    $stmt->bind_param("s", $prescription_code);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $prescription = $result->fetch_assoc();
+    $stmt->close();
+    
+    if ($prescription) {
+        // Update prescription status to 'Completed'
+        $stmt = $conn->prepare("UPDATE prescriptions SET status = 'Completed' WHERE prescription_id = ?");
+        if (!$stmt) {
+            die("Prepare failed (update): " . $conn->error);
+        }
+        $stmt->bind_param("i", $prescription['prescription_id']);
+        $stmt->execute();
+        $stmt->close();
+        
+        // Build details string using the default source.
+        $details = "Type: Dispense Medicine | Source: " . $source;
+        if (!empty($email)) {
+            $details .= " | Email: " . $email;
+        }
+        
+        // Insert transaction record into the database.
+        $transaction_code = "T-" . rand(100, 999);
+        $today = date("Y-m-d H:i:s");
+        $stmt = $conn->prepare("INSERT INTO transactions (prescription_id, transaction_code, patient_name, details, transaction_date) VALUES (?, ?, ?, ?, ?)");
+        if (!$stmt) {
+            die("Prepare failed (insert transaction): " . $conn->error);
+        }
+        $stmt->bind_param("issss", $prescription['prescription_id'], $transaction_code, $patient, $details, $today);
+        $stmt->execute();
+        $stmt->close();
+        
+        $dispense_success = "Dispense processed successfully for Prescription " . $prescription['prescription_code'] . ".";
+    } else {
+        $dispense_success = "Error: Prescription not found or already processed.";
+    }
+}
+
+// ---------------------------
+// Process Manual Dispense
+// ---------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['process_manual_dispense'])) {
+    $patient = $_POST['patient'] ?? '';
+    // Instead of taking source and email from the form, use default values similar to process dispense.
+    $source = "Manual Dispense";
+    $email = "";  // Not used here
+    
+    $medicines = $_POST['medicines'] ?? [];
+    $quantities = $_POST['quantities'] ?? [];
+    
+    if (empty($patient) || empty($medicines) || empty($quantities)) {
+        die("Missing required form data for manual dispense.");
+    }
+    
+    // Begin transaction for atomicity.
+    $conn->begin_transaction();
+    
+    $med_list = [];
+    // Array to hold medicine details for transaction_details insertion.
+    $medicine_details = [];
+    
+    // Deduct inventory and build the medicine list string.
+    for ($i = 0; $i < count($medicines); $i++) {
+        $med_name = trim($medicines[$i]);
+        $qty = intval($quantities[$i]);
+        if (!empty($med_name) && $qty > 0) {
+            $med_list[] = $med_name . " (Qty: " . $qty . ")";
+            $stmt = $conn->prepare("SELECT medicine_id FROM medicine WHERE medicine_name = ?");
+            if ($stmt) {
+                $stmt->bind_param("s", $med_name);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                if ($row = $result->fetch_assoc()) {
+                    $medicine_id = $row['medicine_id'];
+                    // Save details for transaction_details logging.
+                    $medicine_details[] = ['medicine_id' => $medicine_id, 'quantity' => $qty];
+                    // Deduct inventory.
+                    $stmt2 = $conn->prepare("UPDATE inventory SET quantity = quantity - ? WHERE medicine_id = ?");
+                    if ($stmt2) {
+                        $stmt2->bind_param("ii", $qty, $medicine_id);
+                        $stmt2->execute();
+                        $stmt2->close();
+                    }
+                }
+                $stmt->close();
+            }
+        }
+    }
+    
+    if (empty($med_list)) {
+        $conn->rollback();
+        die("No valid medicines provided.");
+    }
+    
+    $medicines_str = implode(", ", $med_list);
+    // Build the details string with type, source, and list of medicines.
+    $details = "Type: Dispense Medicine | Source: " . $source . " | Medicines: " . $medicines_str;
+    
+    // Generate a transaction code and current timestamp.
+    $transaction_code = "T-" . rand(100, 999);
+    $today = date("Y-m-d H:i:s");
+    // For manual dispense, prescription_id is set to 0.
+    $manual_id = 0;
+    
+    // Insert the transaction record.
+    $stmt = $conn->prepare("INSERT INTO transactions (prescription_id, transaction_code, patient_name, details, transaction_date) VALUES (?, ?, ?, ?, ?)");
+    if (!$stmt) {
+        $conn->rollback();
+        die("Prepare failed (manual dispense insert): " . $conn->error);
+    }
+    $stmt->bind_param("issss", $manual_id, $transaction_code, $patient, $details, $today);
+    $stmt->execute();
+    // Get the auto-generated transaction ID.
+    $transaction_id = $conn->insert_id;
+    $stmt->close();
+    
+    // Insert each medicine detail into the transaction_details table.
+    foreach ($medicine_details as $md) {
+        $stmt = $conn->prepare("INSERT INTO transaction_details (transaction_id, medicine_id, quantity, created_at) VALUES (?, ?, ?, ?)");
+        if ($stmt) {
+            $created_at = date("Y-m-d H:i:s");
+            $stmt->bind_param("iiis", $transaction_id, $md['medicine_id'], $md['quantity'], $created_at);
+            $stmt->execute();
+            $stmt->close();
+        }
+    }
+    
+    // Commit the transaction after all queries succeed.
+    $conn->commit();
+    
+    $dispense_success = "Manual dispense processed successfully.";
+}
+
+// ---------------------------
+// Process External Dispense
+// ---------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['process_external_dispense'])) {
+    $external_code = $_POST['external_code'] ?? '';
+    $patient = $_POST['patient'] ?? '';
+    $source = $_POST['source'] ?? '';
+    $email = $_POST['email'] ?? '';
+    $medicines = $_POST['medicines'] ?? [];
+    $quantities = $_POST['quantities'] ?? [];
+    
+    if (empty($external_code) || empty($patient) || empty($source)) {
+        die("Missing required form data for external dispense.");
+    }
+    
+    $med_list = [];
+    $medicine_details = [];
+    for ($i = 0; $i < count($medicines); $i++) {
+        $med_name = trim($medicines[$i]);
+        $qty = intval($quantities[$i]);
+        if (!empty($med_name) && $qty > 0) {
+            $med_list[] = $med_name . " (Qty: " . $qty . ")";
+            $stmt = $conn->prepare("SELECT medicine_id FROM medicine WHERE medicine_name = ?");
+            if ($stmt) {
+                $stmt->bind_param("s", $med_name);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                if ($row = $result->fetch_assoc()) {
+                    $medicine_id = $row['medicine_id'];
+                    $medicine_details[] = ['medicine_id' => $medicine_id, 'quantity' => $qty];
+                    $stmt2 = $conn->prepare("UPDATE inventory SET quantity = quantity - ? WHERE medicine_id = ?");
+                    if ($stmt2) {
+                        $stmt2->bind_param("ii", $qty, $medicine_id);
+                        $stmt2->execute();
+                        $stmt2->close();
+                    }
+                }
+                $stmt->close();
+            }
+        }
+    }
+    if (empty($med_list)) {
+        die("No valid medicines provided.");
+    }
+    $medicines_str = implode(", ", $med_list);
+    $details = "Type: Dispense Medicine | Source: " . $source . " | Medicines: " . $medicines_str;
+    if (!empty($email)) {
+        $details .= " | Email: " . $email;
+    }
+    $transaction_code = "T-" . rand(100, 999);
+    $today = date("Y-m-d H:i:s");
+    // For external dispense, set prescription_id to 0 (or handle as needed)
+    $external_id = 0;
+    $stmt = $conn->prepare("INSERT INTO transactions (prescription_id, transaction_code, patient_name, details, transaction_date) VALUES (?, ?, ?, ?, ?)");
+    if (!$stmt) {
+        die("Prepare failed (external dispense insert): " . $conn->error);
+    }
+    $stmt->bind_param("issss", $external_id, $transaction_code, $patient, $details, $today);
+    $stmt->execute();
+    $transaction_id = $conn->insert_id;
+    $stmt->close();
+    
+    // Log each medicine into transaction_details
+    foreach ($medicine_details as $md) {
+        $stmt = $conn->prepare("INSERT INTO transaction_details (transaction_id, medicine_id, quantity, created_at) VALUES (?, ?, ?, ?)");
+        if ($stmt) {
+            $created_at = date("Y-m-d H:i:s");
+            $stmt->bind_param("iiis", $transaction_id, $md['medicine_id'], $md['quantity'], $created_at);
+            $stmt->execute();
+            $stmt->close();
+        }
+    }
+    
+    $dispense_success = "External dispense processed successfully.";
+}
+
+// ---------------------------
+// Retrieve Pending Prescriptions (with optional filters)
+// ---------------------------
+$patient_filter = $_GET['patient'] ?? "";
+$date_filter = $_GET['date'] ?? "";
+$sql = "SELECT p.*, pat.full_name as patient_name 
+        FROM prescriptions p 
+        JOIN patients pat ON p.patient_id = pat.patient_id 
+        WHERE p.status = 'pending'";
+if (!empty($patient_filter)) {
+    $patient_filter = $conn->real_escape_string($patient_filter);
+    $sql .= " AND pat.full_name LIKE '%$patient_filter%'";
+}
+if (!empty($date_filter)) {
+    $date_filter = $conn->real_escape_string($date_filter);
+    $sql .= " AND DATE(p.created_at) = '$date_filter'";
+}
+$result = $conn->query($sql);
+$pending_prescriptions = [];
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $pending_prescriptions[] = $row;
+    }
+    $result->free();
+}
+
+// ---------------------------
+// Retrieve Transaction History with Medicine Details
+// ---------------------------
+$sql = "SELECT t.*, 
+               GROUP_CONCAT(CONCAT(m.medicine_name, ' (Qty: ', td.quantity, ')') SEPARATOR ', ') as med_details
+        FROM transactions t
+        LEFT JOIN transaction_details td ON t.transaction_id = td.transaction_id
+        LEFT JOIN medicine m ON td.medicine_id = m.medicine_id
+        GROUP BY t.transaction_id
+        ORDER BY t.transaction_date DESC";
+$result = $conn->query($sql);
+$transaction_history = [];
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $transaction_history[] = $row;
+    }
+    $result->free();
+}
+
+// Prebuild medicine options for manual & external dispense
+$medicine_options = "";
+$sqlMed = "SELECT medicine_name FROM medicine ORDER BY medicine_name ASC";
+$resultMed = $conn->query($sqlMed);
+if ($resultMed) {
+    while ($rowMed = $resultMed->fetch_assoc()) {
+        $medicine_options .= '<option value="' . htmlspecialchars($rowMed['medicine_name']) . '">' . htmlspecialchars($rowMed['medicine_name']) . '</option>';
+    }
+    $resultMed->free();
+}
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>

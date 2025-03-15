@@ -1,4 +1,107 @@
+<?php
+// Enable error reporting for debugging
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
+session_start();
+require_once 'db.php'; // Make sure this file establishes $conn properly
+
+$message = "";
+
+// Initialize login attempts and lockout time if not already set
+if (!isset($_SESSION['login_attempts'])) {
+    $_SESSION['login_attempts'] = 0;
+}
+if (!isset($_SESSION['lockout_time'])) {
+    $_SESSION['lockout_time'] = 0;
+}
+
+$max_attempts = 3;
+$lockout_duration = 60; // Lockout period in seconds (5 minutes)
+
+// Check if the user is currently locked out
+if ($_SESSION['login_attempts'] >= $max_attempts) {
+    $elapsed = time() - $_SESSION['lockout_time'];
+    if ($elapsed < $lockout_duration) {
+        $remaining = ceil($lockout_duration - $elapsed);
+        $message = "You have exceeded the maximum number of login attempts. Please try again in {$remaining} seconds.";
+    } else {
+        // Lockout period has expired, reset attempts and lockout time
+        $_SESSION['login_attempts'] = 0;
+        $_SESSION['lockout_time'] = 0;
+    }
+}
+
+// Process form submission if not locked out
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $_SESSION['login_attempts'] < $max_attempts) {
+    $username = trim($_POST['username'] ?? '');
+    $password = trim($_POST['password'] ?? '');
+
+    if (empty($username) || empty($password)) {
+        $message = "Both username and password are required.";
+    } else {
+        // Retrieve user info.
+        $stmt = $conn->prepare("SELECT user_id, username, password, role_id, access_level_id FROM users WHERE username = ?");
+        if ($stmt) {
+            $stmt->bind_param("s", $username);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            if ($result && $result->num_rows === 1) {
+                $user = $result->fetch_assoc();
+                // If the stored password is empty, update it with the provided password.
+                if (empty($user['password'])) {
+                    $updateStmt = $conn->prepare("UPDATE users SET password = ? WHERE user_id = ?");
+                    $updateStmt->bind_param("si", $password, $user['user_id']);
+                    $updateStmt->execute();
+                    $updateStmt->close();
+                    
+                    // Reset login attempts and log the user in.
+                    $_SESSION['login_attempts'] = 0;
+                    $_SESSION['user_id'] = $user['user_id'];
+                    $_SESSION['username'] = $user['username'];
+                    $_SESSION['role_id'] = $user['role_id'];
+                    $_SESSION['access_level_id'] = $user['access_level_id'];
+                    header("Location: index.php");
+                    exit;
+                } else {
+                    // Normal login: compare the plain text password.
+                    if ($password === $user['password']) {
+                        $_SESSION['login_attempts'] = 0; // reset on success
+                        $_SESSION['user_id'] = $user['user_id'];
+                        $_SESSION['username'] = $user['username'];
+                        $_SESSION['role_id'] = $user['role_id'];
+                        $_SESSION['access_level_id'] = $user['access_level_id'];
+                        header("Location: index.php");
+                        exit;
+                    } else {
+                        // Increment login attempts on failed login
+                        $_SESSION['login_attempts']++;
+                        if ($_SESSION['login_attempts'] >= $max_attempts) {
+                            // Set the lockout time when max attempts are reached
+                            $_SESSION['lockout_time'] = time();
+                            $message = "You have exceeded the maximum number of login attempts. Please try again in {$lockout_duration} seconds.";
+                        } else {
+                            $message = "Invalid username or password.";
+                        }
+                    }
+                }
+            } else {
+                // Increment login attempts if username not found
+                $_SESSION['login_attempts']++;
+                if ($_SESSION['login_attempts'] >= $max_attempts) {
+                    $_SESSION['lockout_time'] = time();
+                    $message = "You have exceeded the maximum number of login attempts. Please try again in {$lockout_duration} seconds.";
+                } else {
+                    $message = "Invalid username or password.";
+                }
+            }
+            $stmt->close();
+        } else {
+            $message = "Database error: " . $conn->error;
+        }
+    }
+}
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>

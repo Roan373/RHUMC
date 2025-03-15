@@ -1,4 +1,231 @@
+<?php
+session_start();
+require_once 'db.php'; // Assumes $conn is defined in db.php
+$roles = [];
+$sqlRoles = "SELECT role_id, role_name FROM roles ORDER BY role_name ASC";
+$resultRoles = $conn->query($sqlRoles);
+if ($resultRoles) {
+    while ($row = $resultRoles->fetch_assoc()) {
+        $roles[] = $row;
+    }
+    $resultRoles->free();
+}
 
+// Default profile name in case no user is logged in.
+$profile_name = 'Guest';
+
+// Check if the user is logged in (assuming user_id is stored in session)
+if (isset($_SESSION['user_id'])) {
+    $user_id = $_SESSION['user_id'];
+
+    // Retrieve the full name from staff_details using the users table
+    $sql = "SELECT sd.full_name 
+            FROM staff_details sd 
+            JOIN users u ON sd.staff_id = u.staff_id 
+            WHERE u.user_id = ?";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($full_name);
+        if ($stmt->fetch()) {
+            $profile_name = $full_name;
+        }
+        $stmt->close();
+    }
+}
+// ---------------------------
+// Get Inventory Data (distinct medicine names + total quantity)
+// ---------------------------
+$inventory = [];
+$sqlInv = "SELECT m.medicine_name, SUM(i.quantity) AS total_quantity
+           FROM inventory i
+           JOIN medicine m ON i.medicine_id = m.medicine_id
+           GROUP BY m.medicine_name
+           ORDER BY m.medicine_name ASC";
+$resultInv = $conn->query($sqlInv);
+if ($resultInv) {
+    while ($row = $resultInv->fetch_assoc()) {
+        // Save available quantity for each medicine
+        $inventory[$row['medicine_name']] = (int)$row['total_quantity'];
+    }
+    $resultInv->free();
+}
+$medicine_names = array_keys($inventory);
+
+$message = "";
+
+// ---------------------------
+// Process Form Submissions
+// ---------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $action = $_POST['action'];
+    
+    if ($action === 'remove_prescription') {
+        // DELETE pending prescription
+        $prescription_code = $_POST['prescription_id'];
+        $stmt = $conn->prepare("DELETE FROM prescriptions WHERE prescription_code = ? AND status = 'Pending'");
+        $stmt->bind_param("s", $prescription_code);
+        $stmt->execute();
+        $stmt->close();
+        $message = "Pending prescription removed.";
+        
+    } elseif ($action === 'force_complete_prescription') {
+        // UPDATE: Mark pending prescription as completed
+        $prescription_code = $_POST['prescription_id'];
+        $stmt = $conn->prepare("UPDATE prescriptions SET status = 'Completed' WHERE prescription_code = ? AND status = 'Pending'");
+        $stmt->bind_param("s", $prescription_code);
+        $stmt->execute();
+        $stmt->close();
+        $message = "Prescription $prescription_code completed.";
+        
+    } elseif ($action === 'submit_prescription') {
+        // INSERT new prescription
+        $patient_fullname = trim($_POST["patient_name"]);
+        $instructions = isset($_POST["instructions"]) ? trim($_POST["instructions"]) : "";
+        $medicines = $_POST["medicines"];
+        $quantities = $_POST["quantities"];
+        $errors = [];
+        $valid_medicines = [];
+        
+        if (empty($patient_fullname)) {
+            $errors[] = "Patient name is required.";
+        }
+        
+        // Validate each selected medicine against inventory
+        foreach ($medicines as $i => $med) {
+            $med = trim($med);
+            $qty = (int)$quantities[$i];
+            if (empty($med)) {
+                $errors[] = "Medicine at row " . ($i + 1) . " is required.";
+                continue;
+            }
+            if (!isset($inventory[$med])) {
+                $errors[] = "Medicine '$med' not found in inventory (row " . ($i + 1) . ").";
+                continue;
+            }
+            if ($inventory[$med] <= 0) {
+                $errors[] = "Medicine '$med' is out of stock (row " . ($i + 1) . ").";
+                continue;
+            }
+            if ($inventory[$med] < $qty) {
+                $errors[] = "Only " . $inventory[$med] . " available for '$med' (row " . ($i + 1) . ").";
+                continue;
+            }
+            $valid_medicines[] = ["medicine" => $med, "quantity" => $qty];
+        }
+        
+        if (!empty($errors)) {
+            $message = implode("<br>", $errors);
+        } else {
+            // Get patient_id from patients table (or insert new if not found)
+            $stmt = $conn->prepare("SELECT patient_id FROM patients WHERE full_name = ?");
+            $stmt->bind_param("s", $patient_fullname);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            if ($row = $result->fetch_assoc()) {
+                $patient_id = $row['patient_id'];
+            } else {
+                // Insert new patient record
+                $stmt->close();
+                $stmt = $conn->prepare("INSERT INTO patients (full_name, created_at) VALUES (?, NOW())");
+                $stmt->bind_param("s", $patient_fullname);
+                $stmt->execute();
+                $patient_id = $stmt->insert_id;
+            }
+            $stmt->close();
+            
+            // Generate unique prescription code
+            $prescription_code = "RX-" . str_pad(rand(1, 999), 3, "0", STR_PAD_LEFT);
+            // Insert new prescription
+            $stmt = $conn->prepare("
+                INSERT INTO prescriptions 
+                (prescription_code, patient_id, instructions, status, created_at) 
+                VALUES (?, ?, ?, 'Pending', NOW())
+            ");
+            $stmt->bind_param("sis", $prescription_code, $patient_id, $instructions);
+            $stmt->execute();
+            $prescription_id = $stmt->insert_id;
+            $stmt->close();
+            
+            // Insert each medicine into prescription_medicines
+            foreach ($valid_medicines as $m) {
+                $med_name = $m['medicine'];
+                $qty = $m['quantity'];
+                // Lookup medicine_id from medicine table
+                $stmt = $conn->prepare("SELECT medicine_id FROM medicine WHERE medicine_name = ?");
+                $stmt->bind_param("s", $med_name);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                if ($row = $result->fetch_assoc()) {
+                    $medicine_id = $row['medicine_id'];
+                    // Insert into prescription_medicines
+                    $stmt2 = $conn->prepare("INSERT INTO prescription_medicines (prescription_id, medicine_id, quantity) VALUES (?, ?, ?)");
+                    $stmt2->bind_param("iii", $prescription_id, $medicine_id, $qty);
+                    $stmt2->execute();
+                    $stmt2->close();
+                }
+                $stmt->close();
+            }
+            
+            $message = "Prescription $prescription_code created successfully and added to pending prescriptions.";
+        }
+    }
+}
+
+// ---------------------------
+// Retrieve Pending Prescriptions (with optional filters)
+// ---------------------------
+$patient_filter = $_GET['patient'] ?? "";
+$date_filter = $_GET['date'] ?? "";
+
+$sql = "SELECT p.*, pt.full_name as patient_name,
+          (SELECT GROUP_CONCAT(CONCAT(m.medicine_name, ' (Qty: ', pm.quantity, ')') SEPARATOR ', ')
+           FROM prescription_medicines pm 
+           JOIN medicine m ON pm.medicine_id = m.medicine_id 
+           WHERE pm.prescription_id = p.prescription_id) AS med_list
+        FROM prescriptions p 
+        JOIN patients pt ON p.patient_id = pt.patient_id 
+        WHERE p.status = 'Pending'";
+if (!empty($patient_filter)) {
+    $patient_filter = $conn->real_escape_string($patient_filter);
+    $sql .= " AND pt.full_name LIKE '%$patient_filter%'";
+}
+if (!empty($date_filter)) {
+    $date_filter = $conn->real_escape_string($date_filter);
+    $sql .= " AND DATE(p.created_at) = '$date_filter'";
+}
+
+$result = $conn->query($sql);
+$pending_prescriptions = [];
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $pending_prescriptions[] = $row;
+    }
+    $result->free();
+}
+
+// ---------------------------
+// Retrieve Completed Prescriptions (History)
+// ---------------------------
+$sql = "SELECT p.*, pt.full_name as patient_name,
+          (SELECT GROUP_CONCAT(CONCAT(m.medicine_name, ' (Qty: ', pm.quantity, ')') SEPARATOR ', ')
+           FROM prescription_medicines pm 
+           JOIN medicine m ON pm.medicine_id = m.medicine_id 
+           WHERE pm.prescription_id = p.prescription_id) AS med_list
+        FROM prescriptions p 
+        JOIN patients pt ON p.patient_id = pt.patient_id 
+        WHERE p.status = 'Completed' 
+        ORDER BY p.created_at DESC";
+$result = $conn->query($sql);
+$prescription_history = [];
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $prescription_history[] = $row;
+    }
+    $result->free();
+}
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
